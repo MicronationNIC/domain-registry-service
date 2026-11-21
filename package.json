@@ -8,11 +8,11 @@
   ],
   "license": "ISC",
   "author": "Luna Solar de la Fuente",
-  "type": "commonjs",
+  "type": "module",
   "main": "server.js",
   "scripts": {
-    "test": "node --inspect server.js",
-    "start": "node server.js"
+    "test": "node --inspect server.ts",
+    "start": "node server.ts"
   },
   "dependencies": {
     "@nictool/dns-zone": "^1.4.0",
@@ -22,7 +22,8 @@
     "fs": "^0.0.1-security",
     "https": "^1.0.0",
     "js-yaml": "^5.5.0",
-    "pg": "^8.23.1"
+    "pg": "^8.23.1",
+    "zonefile-parser": "^1.0.1"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",

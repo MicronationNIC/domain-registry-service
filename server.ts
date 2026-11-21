@@ -1,17 +1,17 @@
-require('dotenv').config();
-const express = require('express');
+import 'dotenv/config'
+import express from 'express';
 const app = express();
-const fs = require('fs');
-const https = require('https');
-const yaml = require('js-yaml');
-const { Client } = require('pg');
-const crypto = require('crypto');
-const { domainToASCII } = require('node:url');
-const dnszone = require('@nictool/dns-zone');
-const path = require('node:path');
+import fs from 'fs';
+import https from 'https';
+import *  as yaml from 'js-yaml';
+import { Client } from 'pg';
+import { domainToASCII } from 'node:url';
+import zonefileParser from 'zonefile-parser';
+import path from 'node:path';
 const maindir = process.env.MAINDIR || '/etc/registryservice';
 const port = process.env.PORT || 443;
-const timegrace = parseInt(process.env.TIMEGRACE) || 5000; // In milliseconds
+const timegrace = process.env.TIMEGRACE === undefined ? 5000 : parseInt(process.env.TIMEGRACE); // In milliseconds
+const dns_cfg = yaml.load(fs.readFileSync(maindir + '/dns/dns.yaml').toString()) as Record<string, string>;
 
 let critical_processes_running = 0;
 
@@ -20,8 +20,8 @@ var options = {
     cert: fs.readFileSync(maindir + 'ssl/fullchain.pem', 'utf8')
 }
 
-function setNumStrLen(numstr, len) {
-    numstr = numstr.toString();
+function setNumStrLen(num: number, len?: number | undefined) {
+    let numstr: string = num.toString();
     //console.log(numstr, numstr.length);
     if (!len) len = 2;
     if (numstr.length >= len) return numstr;
@@ -42,15 +42,16 @@ function getTimestamp() {
  * @param {string} registrar - The ID of the registrar to check its authority
  * @param {string} domain_name - The full domain name which is intended to be registered
  */
-function checkRegistrarDomainAuthorityForRegistration(registrar, domain_name) {
+function checkRegistrarDomainAuthorityForRegistration(registrar: string, domain_name: string) {
     if (registrar == undefined) return false;
     if (!(registrar in registrar_cfgs)) return false;
-    if (!('tld-authority' in registrar_cfgs[registrar])) return false;
+    let cfg = (registrar_cfgs as Record<string, any>)[registrar];
+    if (!('tld-authority' in cfg)) return false;
     if (domain_name.endsWith('.')) return false;
     
     let tld = domain_name.includes('.') ? domain_name.substring(domain_name.indexOf('.') + 1) : '.';
     
-    for (let authority of registrar_cfgs[registrar]['tld-authority']) {
+    for (let authority of cfg['tld-authority']) {
         if (authority['tld'] === tld) {
             if (!authority['exclude'].includes(domain_name)) {
                 return true;
@@ -61,9 +62,8 @@ function checkRegistrarDomainAuthorityForRegistration(registrar, domain_name) {
     return false;
 }
 
-const subtle = crypto.webcrypto.subtle;
 const encoder = new TextEncoder();
-async function check_ml_dsa_87_signature(signature_b64, data, key_b64) {
+async function check_ml_dsa_87_signature(signature_b64: string, data: string, key_b64: string) {
     const { ml_dsa87 } = await import('@noble/post-quantum/ml-dsa.js');
     
     try {
@@ -74,7 +74,7 @@ async function check_ml_dsa_87_signature(signature_b64, data, key_b64) {
             return false;
         }
         
-        return await ml_dsa87.verify(
+        return ml_dsa87.verify(
             signature,
             encoder.encode(data),
             public_key
@@ -84,7 +84,7 @@ async function check_ml_dsa_87_signature(signature_b64, data, key_b64) {
     }
 }
 
-function validateDomain(input) {
+function validateDomain(input: any) {
     if (typeof input !== 'string') return null;
 
     // Remove surrounding whitespace.
@@ -122,68 +122,22 @@ function validateDomain(input) {
     return ascii;
 }
 
-async function rfc1035ToJson(filename, default_origin) {
+function rfc1035ToJson(filename: string, default_origin?: string) {
     let domain_records_file_text = fs.readFileSync(filename).toString();
-    let domain_records_full = await dnszone.bind.parseZoneFile(domain_records_file_text);
+    let domain_records_full = zonefileParser.parse(domain_records_file_text);
     
-    let ttl_default = undefined;
-    let records = [];
-    let origin = default_origin;
-    let soa = undefined;
-    
-    for (let record of domain_records_full) {
-        if ('$TTL' in record) {
-            ttl_default = record['$TTL'];
-            continue;
-        }
-        
-        if ('$ORIGIN' in record) {
-            origin = record['$ORIGIN'];
-            continue;
-        }
-        
-        if (record['type'] === undefined) continue;
-        if (record['type'] === 'SOA') {
-            soa = record;
-            continue;
-        }
-        
-        if (record['owner'] === undefined || record['class'] === undefined) continue;
-        
-        let data = undefined;
-        switch (record['type']) {
-            case 'A':
-                data = record['address'];
-                break;
-            case 'TXT':
-                data = record['data'];
-                break;
-            default:
-                break;
-        }
-        
-        if (data === undefined) continue;
-        
-        let name = record['owner'].slice(0, -origin.length);
-        if (name === '') name = '@';
-        
-        records.push({
-            'type': record['type'],
-            'name': name,
-            'ttl': record['ttl'],
-            'data': data
-        });
-    }
+    let ttl_default = domain_records_full.$ttl;
+    let records = domain_records_full.records;
+    let origin = domain_records_full.$origin || default_origin;
     
     return {
         ttl_default,
         records,
-        origin,
-        soa
+        origin
     }
 }
 
-function updateFileAtomic(filename, text, returnIfNotExists) {
+function updateFileAtomic(filename: string, text: string, returnIfNotExists?: boolean) {
     if (returnIfNotExists && !fs.existsSync(filename)) {
         return false;
     }
@@ -200,34 +154,42 @@ function updateFileAtomic(filename, text, returnIfNotExists) {
 
 function getNewZoneSerial() {
     let date = new Date();
-    let dns_ct = fs.readFileSync('dns_ct');
+    let dns_ct = fs.readFileSync('dns_ct').toString();
     let cdate = `${setNumStrLen(date.getUTCFullYear(),4)}${setNumStrLen(date.getUTCMonth())}${setNumStrLen(date.getUTCDate())}`;
     let serialsplit = dns_ct.split(' ',1)
     let ctdate = serialsplit[0];
     let ctval = serialsplit[1];
     if (parseInt(cdate) > parseInt(ctdate)) {
         ctdate = cdate;
-        ctval = 0;
+        ctval = '0';
     } else {
-        ctval = parseInt(ctval) + 1;
+        ctval = (parseInt(ctval) + 1).toString(10);
     }
     fs.writeFileSync(maindir + 'cfg/dns/dns_ct', ctdate + ' ' + ctval);
     return cdate + ctval;
 }
 
-function prepareTxtRecord(text) {
-    if (typeof text !== String) return '';
-    text = ''; // REMEMBER TO REMOVE THIS LINE, THIS LINE BREAKS THE CODE IN EXCHANGE FOR FIXING TYPES
+function prepareTxtRecord(text: String) {
+    console.log(typeof text)//if (typeof text !== String) return '';
 }
 
 const A_DATA_REGEX = /^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])$/;
 const AAAA_DATA_REGEX = /^(?:(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,7}:|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}|(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}|(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}|(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:(?::[0-9a-fA-F]{1,4}){1,6}|:(?:(?::[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(?::[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(?:ffff(?::0{1,4}){0,1}:){0,1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])|(?:[0-9a-fA-F]{1,4}:){1,4}:(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9]))$/;
-function updateDomainFile(domain_name, json) {
+function updateDomainFile(domain_name: string, json: {
+    ttl_default: any;
+    records: {
+        type: any;
+        name: any;
+        ttl: any;
+        data: any;
+    }[];
+    origin: string | undefined;
+}) {
     let filename = dns_cfg['zones-dir'] + '/db.' + domain_name;
     let text = `$TTL ${json['ttl_default']}\n$ORIGIN ${json['origin']}\n\n`;
-    text += `@ IN SOA ns1.sandwich.po. hostmaster.sandwich.po. ${getNewZoneSerial()} 3600 600 1209600 300\n`
+    text += `@ IN SOA ns1.${json['origin']} hostmaster.${json['origin']} ${getNewZoneSerial()} 3600 600 1209600 300\n`
     
-    for (record of json['records']) {
+    for (let record of json['records']) {
         if (!['A', 'AAAA', 'TXT'].includes(record['type'])) continue;
         text += '\n' + record['name'] + ' ';
         if (record['ttl'] !== undefined) text += record['ttl'] + ' ';
@@ -251,10 +213,27 @@ function updateDomainFile(domain_name, json) {
     }
     return updateFileAtomic(filename, text, true) ? 'OK' : 'ATOMIC_WRITE_FAIL';
 }
-rfc1035ToJson('./cfg/dns/zones/db.pizza.po').then((v) => console.log(v));
+console.log(rfc1035ToJson('./cfg/dns/zones/db.pizza.po'))
 
-function updateRfc1035Record(filename, idToUpdate, newRecord) {
+function updateRfc1035Record(filename: string, idToUpdate: number, newRecord: {
+    type: string,
+    name: string,
+    ttl: string | number,
+    data: string
+}) {
     let current = rfc1035ToJson(filename);
+}
+
+function checkForContents(item: {}, contents: Iterable<any>) {
+    for (let content of contents) {
+        if (!(content in item)) return false;
+    }
+    return true;
+}
+
+if (!checkForContents(process.env, ['COREDNS_USER', 'COREDNS_GROUP'])) {
+    console.error(`[FATAL @ ${getTimestamp()}] Some environment variables critical to the functioning of the website are missing.`);
+    process.exitCode = 1;
 }
 
 // Load postgres
@@ -263,27 +242,28 @@ const client = new Client({
     host: process.env.POSTGRES_HOST || 'localhost',
     database: process.env.POSTGRES_DB || 'domain_registry_db',
     password: process.env.POSTGRES_PASSWD,
-    port: process.env.POSTGRES_PORT || 5432,
+    port: process.env.POSTGRES_PORT === undefined ? 5432 : parseInt(process.env.POSTGRES_PORT),
 });
 client.connect();
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const registrars = yaml.load(fs.readFileSync(maindir + '/registrars/registrardb.yaml'));
-const registrar_cfgs = {}
+const registrars = yaml.load(fs.readFileSync(maindir + '/registrars/registrardb.yaml').toString()) as Record<string, string>;
+const registrar_cfgs = {} as Record<string, any>
 for (let registrar of Object.keys(registrars)) {
     let cfgfile = registrars[registrar].startsWith('/') ? registrars[registrar] : maindir + '/' + registrars[registrar];
     if (!fs.existsSync(cfgfile)) {
         console.error(`[ERROR @ ${getTimestamp()}] Configuration file for ${registrar} does not exist at ${cfgfile}.`);
-        registrars[registrar] = undefined;
+        registrars
+        delete registrars[registrar];
         continue;
     }
     registrar_cfgs[registrar] = yaml.load(fs.readFileSync(cfgfile).toString());
 }
 
 app.get('/check-domain-availability', async (req, res) => {
-    let registrar_id = req.query.registrar_id;
+    let registrar_id = req.query.registrar_id?.toString();
     let domain_name = validateDomain(req.query.domain_name);
     // Validate domain_name field
     if (domain_name == null) {
@@ -296,7 +276,7 @@ app.get('/check-domain-availability', async (req, res) => {
     
     // See if the domain name is already registered
     let qres = await client.query('SELECT domain_name FROM public.domains WHERE domain_name = $1', [domain_name]);
-    if (qres.rowCount > 0) {
+    if (qres.rowCount !== null && qres.rowCount > 0) {
         return res.status(200).json({
             'success': true,
             'status_text': "DOMAIN_ALREADY_REGISTERED",
@@ -305,7 +285,7 @@ app.get('/check-domain-availability', async (req, res) => {
     }
     
     // See if the domain name is eligible for registration by that registrar
-    if (!checkRegistrarDomainAuthorityForRegistration(registrar_id, domain_name)) {
+    if (registrar_id === undefined || !checkRegistrarDomainAuthorityForRegistration(registrar_id, domain_name)) {
         return res.status(200).json({
             'success': true,
             'status_text': "DOMAIN_NOT_REGISTERED",
@@ -320,7 +300,6 @@ app.get('/check-domain-availability', async (req, res) => {
     });
 });
 
-const dns_cfg = yaml.load(fs.readFileSync(maindir + '/dns/dns.yaml'));
 app.post('/register-domain', async (req, res) => {
     let date = new Date();
     let timenow = date.getTime();
@@ -441,6 +420,18 @@ app.post('/register-domain', async (req, res) => {
         `\t${dns_ct[0] + dns_ct[1]} ; SEPARATE HERE\n\t3600\n\t600\n\t1209600\n\t300\n)\n ; SEPARATE HERE\n`
     );
     
+    if (process.env.COREDNS_USER === undefined || process.env.COREDNS_GROUP === undefined) {
+        res.status(500).json({
+            'success': false,
+            'status_text': 'SERVER_MISSING_CRITICAL_CONFIGURATIONS',
+            'status_code': 500,
+            'try_again': false,
+            'domain_name': domain_name
+        });
+        process.exitCode = 1;
+        return;
+    }
+    
     fs.chownSync(
         dns_cfg['zones-dir'] + '/db.' + domain_name_ascii,
         parseInt(process.env.COREDNS_USER),
@@ -473,7 +464,17 @@ app.post('/register-domain', async (req, res) => {
 app.get('/manage-domain/list-records/:domain', async (req, res) => {
     let date = new Date();
     let timenow = date.getTime();
-    let authtokenjson = JSON.parse(req.header('Authorization'));
+    let authheader = req.header('Authorization')
+    if (authheader === undefined) {
+        return res.status(401).json({
+            'success': false,
+            'status_text': 'AUTHORIZATION_HEADER_UNDEFINED',
+            'status_code': 401,
+            'records': []
+        });
+    }
+    
+    let authtokenjson = JSON.parse(authheader);
     let authtoken = authtokenjson['authtoken'];
     let timeauth = authtokenjson['timeauth'];
     let registrar_id = authtokenjson['registrar_id'];
@@ -549,51 +550,11 @@ app.get('/manage-domain/list-records/:domain', async (req, res) => {
     
     // Find the file with the domain records and extract DNS records and default TTL
     let domain_records_file_text = fs.readFileSync(dns_cfg['zones-dir'] + '/db.' + domain_name).toString();
-    let domain_records_full = await dnszone.bind.parseZoneFile(domain_records_file_text);
+    let domain_records_full = zonefileParser.parse(domain_records_file_text);
     
-    let ttl_default = undefined;
-    let records = [];
-    let origin = domain_name + '.';
-    
-    for (let record of domain_records_full) {
-        if ('$TTL' in record) {
-            ttl_default = record['$TTL'];
-            continue;
-        }
-        
-        if ('$ORIGIN' in record) {
-            origin = record['$ORIGIN'];
-            continue;
-        }
-        
-        if (record['type'] === undefined || record['type'] === 'SOA') continue;
-        
-        if (record['owner'] === undefined || record['class'] === undefined) continue;
-        
-        let data = undefined;
-        switch (record['type']) {
-            case 'A':
-                data = record['address'];
-                break;
-            case 'TXT':
-                data = record['data'];
-                break;
-            default:
-                break;
-        }
-        
-        if (data === undefined) continue;
-        
-        let name = record['owner'].slice(0, -origin.length);
-        if (name === '') name = '@';
-        
-        records.push({
-            'type': record['type'],
-            'name': name,
-            'ttl': record['ttl'],
-            'data': data
-        });
-    }
+    let ttl_default = domain_records_full.$ttl;
+    let records = domain_records_full.records;
+    let origin = domain_records_full.$origin || domain_name + '.';
     
     // Return the final records
     res.status(200).json({
