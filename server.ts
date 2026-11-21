@@ -6,7 +6,7 @@ import https from 'https';
 import *  as yaml from 'js-yaml';
 import { Client } from 'pg';
 import { domainToASCII } from 'node:url';
-import zonefileParser from 'zonefile-parser';
+import * as dnszone from '@nictool/dns-zone';
 import path from 'node:path';
 const maindir = process.env.MAINDIR || '/etc/registryservice';
 const port = process.env.PORT || 443;
@@ -122,18 +122,75 @@ function validateDomain(input: any) {
     return ascii;
 }
 
-function rfc1035ToJson(filename: string, default_origin?: string) {
+async function rfc1035ToJson(filename: string, default_origin?: string) {
     let domain_records_file_text = fs.readFileSync(filename).toString();
-    let domain_records_full = zonefileParser.parse(domain_records_file_text);
+    let domain_records_full = await dnszone.bind.parseZoneFile(domain_records_file_text);
     
-    let ttl_default = domain_records_full.$ttl;
-    let records = domain_records_full.records;
-    let origin = domain_records_full.$origin || default_origin;
+    let ttl_default = undefined;
+    let records = [];
+    let origin = default_origin;
+    let soa = undefined;
+    
+    for (let record of domain_records_full) {
+        if ('$TTL' in record) {
+            if (typeof record['$TTL'] !== 'number') continue;
+            ttl_default = record['$TTL'] as number;
+            continue;
+        }
+        
+        if ('$ORIGIN' in record) {
+            if (typeof record['$ORIGIN'] !== 'string') continue;
+            origin = record['$ORIGIN'] as string;
+            continue;
+        }
+        
+        if (origin === undefined) {
+            console.warn(`[WARN @ ${getTimestamp()}] No origin specified in the record at ${filename}.`)
+            continue;
+        }
+        
+        if (record['type'] === undefined) continue;
+        if (record['type'] === 'SOA') {
+            soa = record;
+            continue;
+        }
+        
+        if (record['owner'] === undefined || record['class'] === undefined) continue;
+        
+        let data = undefined;
+        switch (record['type']) {
+            case 'A':
+                if (typeof record['address'] === 'string') data = record['address'];
+                break;
+            case 'AAAA':
+                if (typeof record['address'] === 'string') data = record['address'];
+                break;
+            case 'TXT':
+                if (typeof record['data'] === 'string') data = record['data'];
+                break;
+            default:
+                break;
+        }
+        
+        if (data === undefined) continue;
+        
+        let name = record['owner'].slice(0, -origin.length);
+        if (name === '') name = '@';
+        if (name.endsWith('.')) name = name.slice(0, -1);
+        
+        records.push({
+            'type': record['type'],
+            'name': name,
+            'ttl': record['ttl'],
+            'data': data
+        });
+    }
     
     return {
         ttl_default,
         records,
-        origin
+        origin,
+        soa
     }
 }
 
@@ -169,8 +226,42 @@ function getNewZoneSerial() {
     return cdate + ctval;
 }
 
-function prepareTxtRecord(text: String) {
-    console.log(typeof text)//if (typeof text !== String) return '';
+function prepareTxtRecord(text: string) {
+    if (typeof text !== 'string') return '';
+    let bytes = encoder.encode(text);
+    if (bytes.length === 0) return '""';
+    if (bytes.length > 65535) return '""'; // too long
+    
+    const chunks = [];
+    let currentChunk = '';
+    let currentByteLen = 0;
+    
+    for (let byte of bytes) {
+        if (currentByteLen === 255) {
+            chunks.push(currentChunk);
+            currentChunk = '';
+            currentByteLen = 0;
+        }
+        
+        switch (byte) {
+            case 0x22:
+                currentChunk += '\\"';
+                break;
+            case 0x5c:
+                currentChunk += '\\\\';
+                break;
+            default:
+                if (byte < 0x20 || byte > 0x7e) {
+                    currentChunk += `\\${byte.toString(10).padStart(3, '0')}`;
+                } else {
+                    currentChunk += String.fromCharCode(byte);
+                }
+        }
+        
+        currentByteLen++;
+    }
+    
+    return chunks.join(' ');
 }
 
 const A_DATA_REGEX = /^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])$/;
@@ -191,6 +282,7 @@ function updateDomainFile(domain_name: string, json: {
     
     for (let record of json['records']) {
         if (!['A', 'AAAA', 'TXT'].includes(record['type'])) continue;
+        if (record['name'] !== '@') record['name'] = validateDomain(record['name']);
         text += '\n' + record['name'] + ' ';
         if (record['ttl'] !== undefined) text += record['ttl'] + ' ';
         text += ' IN ' + record['type'] + ' ';
@@ -208,20 +300,25 @@ function updateDomainFile(domain_name: string, json: {
                 }
                 return 'INVALID_DATA';
             case 'TXT':
-                
+                text += prepareTxtRecord(record['data']);
+                break;
         }
     }
     return updateFileAtomic(filename, text, true) ? 'OK' : 'ATOMIC_WRITE_FAIL';
 }
-console.log(rfc1035ToJson('./cfg/dns/zones/db.pizza.po'))
+// rfc1035ToJson('./cfg/dns/zones/db.pizza.po').then((v) => {console.log(v)});
 
-function updateRfc1035Record(filename: string, idToUpdate: number, newRecord: {
+async function updateRfc1035Record(domain_name: string, idToUpdate: number, newRecord: {
     type: string,
     name: string,
-    ttl: string | number,
-    data: string
+    ttl: number | undefined,
+    data: any
 }) {
-    let current = rfc1035ToJson(filename);
+    let filename = dns_cfg['zones-dir'] + '/db.' + domain_name;
+    let current = await rfc1035ToJson(filename);
+    if (idToUpdate > current['records'].length) return 'ID_TOO_BIG';
+    current['records'][idToUpdate] = newRecord;
+    return updateDomainFile(domain_name, current);
 }
 
 function checkForContents(item: {}, contents: Iterable<any>) {
@@ -234,6 +331,28 @@ function checkForContents(item: {}, contents: Iterable<any>) {
 if (!checkForContents(process.env, ['COREDNS_USER', 'COREDNS_GROUP'])) {
     console.error(`[FATAL @ ${getTimestamp()}] Some environment variables critical to the functioning of the website are missing.`);
     process.exitCode = 1;
+}
+
+async function confirmRegistrarSignature(
+    req: express.Request, date: Date, authtokendata: {}, timeauth: number, registrar_id: string
+) {
+    let authheader = req.header('Authorization')
+    if (authheader === undefined) return 'NO_SIGNATURE';
+    let timenow = date.getTime();
+    if (timeauth + timegrace < timenow || timeauth > timenow + timegrace) return 'EXPIRED';
+    if (!(registrar_id in registrar_cfgs)) return 'REGISTRAR_INVALID';
+    if (!('public-key' in registrar_cfgs[registrar_id]) || !('filename' in registrar_cfgs[registrar_id]['public-key'])) {
+        console.error(`[ERROR @ ${getTimestamp()}] No key specified for registrar ${registrar_id}.`);
+        return 'NO_PUBLIC_KEY_LISTED';
+    }
+    let public_key_location = registrar_cfgs[registrar_id]['public-key']['filename'];
+    public_key_location = public_key_location.startsWith('/') ? public_key_location : maindir + '/' + public_key_location;
+    if (!fs.existsSync(public_key_location)) {
+        console.error(`[ERROR @ ${getTimestamp()}] No key exists at the specified location for registrar ${registrar_id}.`);
+        return 'NO_KEY';
+    }
+    let pubkey = fs.readFileSync(public_key_location).toString();
+    return await check_ml_dsa_87_signature(authheader, JSON.stringify(authtokendata), pubkey) ? 'OK' : 'SIGNATURE_INCORRECT';
 }
 
 // Load postgres
@@ -549,12 +668,10 @@ app.get('/manage-domain/list-records/:domain', async (req, res) => {
     }
     
     // Find the file with the domain records and extract DNS records and default TTL
-    let domain_records_file_text = fs.readFileSync(dns_cfg['zones-dir'] + '/db.' + domain_name).toString();
-    let domain_records_full = zonefileParser.parse(domain_records_file_text);
+    let domain_records_full = await rfc1035ToJson(dns_cfg['zones-dir'] + '/db.' + domain_name, domain_name + '.');
     
-    let ttl_default = domain_records_full.$ttl;
+    let ttl_default = domain_records_full.ttl_default;
     let records = domain_records_full.records;
-    let origin = domain_records_full.$origin || domain_name + '.';
     
     // Return the final records
     res.status(200).json({
@@ -564,6 +681,141 @@ app.get('/manage-domain/list-records/:domain', async (req, res) => {
         'records': records,
         'ttl_default': ttl_default
     });
+});
+
+app.patch('/manage-domain/update-record', async (req, res) => {
+    let date = new Date();
+    let timeauth = req.body.timeauth;
+    let registrar_id = req.body.registrar_id;
+    
+    let domain_name = validateDomain(req.body.domain_name);
+    if (domain_name === null) {
+        return res.status(422).json({
+            'success': false,
+            'status_text': 'INVALID_DOMAIN_NAME',
+            'status_code': 422
+        });
+    }
+    
+    let type = req.body.type;
+    let name = req.body.record_name;
+    if (name !== '@') name = validateDomain(name);
+    let ttl = req.body.ttl;
+    let data = req.body.data;
+    let record_id = req.body.record_id;
+    
+    // Confirm the registrar's signature
+    let authtokendata = {
+        timeauth,
+        registrar_id,
+        'intent': 'update-record',
+        domain_name,
+        type,
+        name,
+        ttl,
+        data,
+        record_id
+    }
+    let sigveri = await confirmRegistrarSignature(req, date, authtokendata, timeauth, registrar_id);
+    if (['NO_PUBLIC_KEY_LISTED', 'NO_KEY'].includes(sigveri)) {
+        return res.status(500).json({
+            'success': false,
+            'status_text': 'SERVER_DOES_NOT_HAVE_REGISTRAR_KEY',
+            'status_code': 500
+        });
+    }
+    if (sigveri !== 'OK') {
+        return res.status(401).json({
+            'success': false,
+            'status_text': 'INVALID_REGISTRAR_CREDENTIALS',
+            'status_code': 401
+        });
+    }
+    
+    // Confirm that the registrar is authorised to make the change
+    let qres = await client.query('SELECT registrar_id FROM public.domains WHERE domain_name = $1', [domain_name]);
+    if (qres.rowCount === 0) {
+        return res.status(404).json({
+            'success': false,
+            'status_text': 'DOMAIN_DOES_NOT_EXIST_ON_REGISTRY',
+            'status_code': 404
+        });
+    }
+    
+    if (qres.rows[0]['registrar_id'] !== registrar_id) {
+        return res.status(403).json({
+            'success': false,
+            'status_text': 'DOMAIN_DOES_NOT_BELONG_TO_REGISTRAR',
+            'status_code': 403
+        });
+    }
+    
+    let record_id_num = parseInt(record_id);
+    
+    if (Number.isNaN(record_id_num)) {
+        return res.status(422).json({
+            'success': false,
+            'status_text': 'INVALID_RECORD_ID',
+            'status_code': 422
+        });
+    }
+    
+    let ttl_number = parseInt(ttl);
+    
+    if (Number.isNaN(ttl_number)) {
+        return res.status(422).json({
+            'success': false,
+            'status_text': 'INVALID_TTL',
+            'status_code': 422
+        });
+    }
+    
+    // Attempt to make the change
+    let update_status = await updateRfc1035Record(domain_name, record_id_num, {
+        type,
+        name,
+        'ttl': ttl_number,
+        data
+    });
+    
+    switch (update_status) {
+        case 'ID_TOO_BIG':
+            return res.status(422).json({
+                'success': false,
+                'status_text': 'ID_TOO_BIG',
+                'status_code': 422
+            });
+        case 'INVALID_DATA':
+            return res.status(422).json({
+                'success': false,
+                'status_text': 'INVALID_DATA',
+                'status_code': 422
+            });
+        case 'OK':
+            return res.status(200).json({
+                'success': true,
+                'status_text': 'UPDATE_SUCCESSFUL',
+                'status_code': 200
+            });
+        case 'ATOMIC_WRITE_FAIL':
+            return res.status(500).json({
+                'success': false,
+                'status_text': 'ATOMIC_WRITE_FAILED',
+                'status_code': 500
+            });
+    }
+    
+    console.error(`[ERROR @ ${getTimestamp()}] Poor handling of update_status value ${update_status} in /manage-domains/update-record.`);
+    return res.status(500).json({
+        'success': update_status === 'OK',
+        'status_text': 'POOR_UPDATE_STATUS_HANDLING',
+        'status_code': 500
+    });
+});
+
+app.get('/source-code', (req, res) => {
+    if (process.env.SOURCE_CODE) return res.redirect(process.env.SOURCE_CODE);
+    return res.status(404).send('Error 404: Not Found');
 });
 
 https.createServer(options, app).listen(port, () => {
