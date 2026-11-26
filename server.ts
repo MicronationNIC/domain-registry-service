@@ -20,8 +20,8 @@ var options = {
     cert: fs.readFileSync(maindir + 'ssl/fullchain.pem', 'utf8')
 }
 
-function setNumStrLen(num: number, len?: number | undefined) {
-    let numstr: string = num.toString();
+function setNumStrLen(num: number | string, len?: number | undefined) {
+    let numstr: string = typeof num === 'string' ? num : num.toString();
     //console.log(numstr, numstr.length);
     if (!len) len = 2;
     if (numstr.length >= len) return numstr;
@@ -223,7 +223,7 @@ function getNewZoneSerial() {
         ctval = (parseInt(ctval) + 1).toString(10);
     }
     fs.writeFileSync(maindir + 'dns/dns_ct', ctdate + ' ' + ctval);
-    return cdate + ctval;
+    return cdate + setNumStrLen(ctval);
 }
 
 function prepareTxtRecord(text: string) {
