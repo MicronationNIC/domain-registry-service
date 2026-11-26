@@ -53,7 +53,7 @@ function checkRegistrarDomainAuthorityForRegistration(registrar: string, domain_
     
     for (let authority of cfg['tld-authority']) {
         if (authority['tld'] === tld) {
-            if (!authority['exclude'].includes(domain_name)) {
+            if (!authority['exclude']?.includes(domain_name)) {
                 return true;
             }
         }
