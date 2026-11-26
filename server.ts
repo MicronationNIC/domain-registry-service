@@ -285,6 +285,7 @@ function updateDomainFile(domain_name: string, json: {
     text += `@ IN SOA ns1.${json['origin']} hostmaster.${json['origin']} ${getNewZoneSerial()} 3600 600 1209600 300\n`
     
     for (let record of json['records']) {
+        if (record === undefined) continue;
         if (!['A', 'AAAA', 'TXT'].includes(record['type'])) continue;
         if (record['name'] !== '@') record['name'] = validateDomain(record['name']);
         text += '\n' + record['name'] + ' ';
@@ -322,6 +323,14 @@ async function updateRfc1035Record(domain_name: string, idToUpdate: number, newR
     let current = await rfc1035ToJson(filename, domain_name + '.');
     if (idToUpdate > current['records'].length) return 'ID_TOO_BIG';
     current['records'][idToUpdate] = newRecord;
+    return updateDomainFile(domain_name, current);
+}
+
+async function deleteRfc1035Record(domain_name: string, idToUpdate: number) {
+    let filename = dns_cfg['zones-dir'] + '/db.' + domain_name;
+    let current = await rfc1035ToJson(filename, domain_name + '.');
+    if (idToUpdate > current['records'].length - 1) return 'ID_TOO_BIG';
+    delete current['records'][idToUpdate];
     return updateDomainFile(domain_name, current);
 }
 
@@ -784,6 +793,112 @@ app.patch('/manage-domain/update-record', async (req, res) => {
         'ttl': ttl_number,
         data
     });
+    
+    switch (update_status) {
+        case 'ID_TOO_BIG':
+            return res.status(422).json({
+                'success': false,
+                'status_text': 'ID_TOO_BIG',
+                'status_code': 422
+            });
+        case 'INVALID_DATA':
+            return res.status(422).json({
+                'success': false,
+                'status_text': 'INVALID_DATA',
+                'status_code': 422
+            });
+        case 'OK':
+            return res.status(200).json({
+                'success': true,
+                'status_text': 'UPDATE_SUCCESSFUL',
+                'status_code': 200
+            });
+        case 'ATOMIC_WRITE_FAIL':
+            return res.status(500).json({
+                'success': false,
+                'status_text': 'ATOMIC_WRITE_FAILED',
+                'status_code': 500
+            });
+    }
+    
+    console.error(`[ERROR @ ${getTimestamp()}] Poor handling of update_status value ${update_status} in /manage-domains/update-record.`);
+    return res.status(500).json({
+        'success': update_status === 'OK',
+        'status_text': 'POOR_UPDATE_STATUS_HANDLING',
+        'status_code': 500
+    });
+});
+
+app.delete('/manage-domain/delete-record', async (req, res) => {
+    let date = new Date();
+    let timeauth = req.body.timeauth;
+    let registrar_id = req.body.registrar_id;
+    
+    let domain_name = validateDomain(req.body.domain_name);
+    if (domain_name === null) {
+        return res.status(422).json({
+            'success': false,
+            'status_text': 'INVALID_DOMAIN_NAME',
+            'status_code': 422
+        });
+    }
+    let record_id = req.body.record_id;
+    
+    // Confirm the registrar's signature
+    let authtokendata = {
+        timeauth,
+        registrar_id,
+        'intent': 'update-record',
+        domain_name,
+        record_id
+    }
+    
+    let sigveri = await confirmRegistrarSignature(req, date, authtokendata);
+    if (['NO_PUBLIC_KEY_LISTED', 'NO_KEY'].includes(sigveri)) {
+        return res.status(500).json({
+            'success': false,
+            'status_text': 'SERVER_DOES_NOT_HAVE_REGISTRAR_KEY',
+            'status_code': 500
+        });
+    }
+    if (sigveri !== 'OK') {
+        return res.status(401).json({
+            'success': false,
+            'status_text': 'INVALID_REGISTRAR_CREDENTIALS',
+            'status_code': 401
+        });
+    }
+    
+    // Confirm that the registrar is authorised to make the change
+    let qres = await client.query('SELECT registrar_id FROM public.domains WHERE domain_name = $1', [domain_name]);
+    if (qres.rowCount === 0) {
+        return res.status(404).json({
+            'success': false,
+            'status_text': 'DOMAIN_DOES_NOT_EXIST_ON_REGISTRY',
+            'status_code': 404
+        });
+    }
+    
+    if (qres.rows[0]['registrar_id'] !== registrar_id) {
+        return res.status(403).json({
+            'success': false,
+            'status_text': 'DOMAIN_DOES_NOT_BELONG_TO_REGISTRAR',
+            'status_code': 403
+        });
+    }
+    
+    let record_id_num = parseInt(record_id);
+    
+    if (Number.isNaN(record_id_num)) {
+        return res.status(422).json({
+            'success': false,
+            'status_text': 'INVALID_RECORD_ID',
+            'status_code': 422
+        });
+    }
+    
+    // Attempt to make the change
+    let update_status = await deleteRfc1035Record(domain_name, record_id_num);
     
     switch (update_status) {
         case 'ID_TOO_BIG':
