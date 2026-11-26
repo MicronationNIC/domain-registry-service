@@ -34,7 +34,7 @@ function setNumStrLen(num: number, len?: number | undefined) {
 
 function getTimestamp() {
     let now = new Date()
-    return `${now.getUTCFullYear()}-${setNumStrLen(now.getUTCMonth())}-${setNumStrLen(now.getUTCDate())} ${setNumStrLen(now.getUTCHours())}:${setNumStrLen(now.getUTCMinutes())}:${setNumStrLen(now.getUTCSeconds())}.${setNumStrLen(now.getUTCMilliseconds(), 3)} UTC`;
+    return `${now.getUTCFullYear()}-${setNumStrLen(now.getUTCMonth()+1)}-${setNumStrLen(now.getUTCDate())} ${setNumStrLen(now.getUTCHours())}:${setNumStrLen(now.getUTCMinutes())}:${setNumStrLen(now.getUTCSeconds())}.${setNumStrLen(now.getUTCMilliseconds(), 3)} UTC`;
 }
 
 /**
@@ -211,9 +211,9 @@ function updateFileAtomic(filename: string, text: string, returnIfNotExists?: bo
 
 function getNewZoneSerial() {
     let date = new Date();
-    let dns_ct = fs.readFileSync('dns_ct').toString();
-    let cdate = `${setNumStrLen(date.getUTCFullYear(),4)}${setNumStrLen(date.getUTCMonth())}${setNumStrLen(date.getUTCDate())}`;
-    let serialsplit = dns_ct.split(' ',1)
+    let dns_ct = fs.readFileSync(maindir + '/dns/dns_ct').toString();
+    let cdate = `${setNumStrLen(date.getUTCFullYear(),4)}${setNumStrLen(date.getUTCMonth()+1)}${setNumStrLen(date.getUTCDate())}`;
+    let serialsplit = dns_ct.split(' ')
     let ctdate = serialsplit[0];
     let ctval = serialsplit[1];
     if (parseInt(cdate) > parseInt(ctdate)) {
@@ -222,7 +222,7 @@ function getNewZoneSerial() {
     } else {
         ctval = (parseInt(ctval) + 1).toString(10);
     }
-    fs.writeFileSync(maindir + 'cfg/dns/dns_ct', ctdate + ' ' + ctval);
+    fs.writeFileSync(maindir + 'dns/dns_ct', ctdate + ' ' + ctval);
     return cdate + ctval;
 }
 
@@ -238,7 +238,7 @@ function prepareTxtRecord(text: string) {
     
     for (let byte of bytes) {
         if (currentByteLen === 255) {
-            chunks.push(currentChunk);
+            chunks.push(`"${currentChunk}"`);
             currentChunk = '';
             currentByteLen = 0;
         }
@@ -261,6 +261,10 @@ function prepareTxtRecord(text: string) {
         currentByteLen++;
     }
     
+    if (currentByteLen > 0) {
+        chunks.push(`"${currentChunk}"`);
+    }
+    
     return chunks.join(' ');
 }
 
@@ -277,7 +281,7 @@ function updateDomainFile(domain_name: string, json: {
     origin: string | undefined;
 }) {
     let filename = dns_cfg['zones-dir'] + '/db.' + domain_name;
-    let text = `$TTL ${json['ttl_default']}\n$ORIGIN ${json['origin']}\n\n`;
+    let text = `$ORIGIN ${json['origin']}\n$TTL ${json['ttl_default']}\n\n`;
     text += `@ IN SOA ns1.${json['origin']} hostmaster.${json['origin']} ${getNewZoneSerial()} 3600 600 1209600 300\n`
     
     for (let record of json['records']) {
@@ -315,7 +319,7 @@ async function updateRfc1035Record(domain_name: string, idToUpdate: number, newR
     data: any
 }) {
     let filename = dns_cfg['zones-dir'] + '/db.' + domain_name;
-    let current = await rfc1035ToJson(filename);
+    let current = await rfc1035ToJson(filename, domain_name + '.');
     if (idToUpdate > current['records'].length) return 'ID_TOO_BIG';
     current['records'][idToUpdate] = newRecord;
     return updateDomainFile(domain_name, current);
@@ -334,11 +338,14 @@ if (!checkForContents(process.env, ['COREDNS_USER', 'COREDNS_GROUP'])) {
 }
 
 async function confirmRegistrarSignature(
-    req: express.Request, date: Date, authtokendata: {}, timeauth: number, registrar_id: string
+    req: express.Request, date: Date, authtokendata: {}
 ) {
-    let authheader = req.header('Authorization')
-    if (authheader === undefined) return 'NO_SIGNATURE';
+    let authheadertxt = req.header('Authorization');
+    if (authheadertxt === undefined) return 'NO_SIGNATURE';
+    let authheader = JSON.parse(authheadertxt);
     let timenow = date.getTime();
+    let timeauth = authheader['timeauth'];
+    let registrar_id = authheader['registrar_id'];
     if (timeauth + timegrace < timenow || timeauth > timenow + timegrace) return 'EXPIRED';
     if (!(registrar_id in registrar_cfgs)) return 'REGISTRAR_INVALID';
     if (!('public-key' in registrar_cfgs[registrar_id]) || !('filename' in registrar_cfgs[registrar_id]['public-key'])) {
@@ -352,7 +359,7 @@ async function confirmRegistrarSignature(
         return 'NO_KEY';
     }
     let pubkey = fs.readFileSync(public_key_location).toString();
-    return await check_ml_dsa_87_signature(authheader, JSON.stringify(authtokendata), pubkey) ? 'OK' : 'SIGNATURE_INCORRECT';
+    return await check_ml_dsa_87_signature(authheader['authtoken'], JSON.stringify(authtokendata), pubkey) ? 'OK' : 'SIGNATURE_INCORRECT';
 }
 
 // Load postgres
@@ -524,7 +531,7 @@ app.post('/register-domain', async (req, res) => {
     // Assume CoreDNS for now
     let dns_ct = fs.readFileSync(maindir + '/dns/dns_ct').toString().split(' '); // date, then daily count
     
-    let cdate = `${setNumStrLen(date.getUTCFullYear(),4)}${setNumStrLen(date.getUTCMonth())}${setNumStrLen(date.getUTCDate())}`;
+    let cdate = `${setNumStrLen(date.getUTCFullYear(),4)}${setNumStrLen(date.getUTCMonth()+1)}${setNumStrLen(date.getUTCDate())}`;
     
     if (parseInt(dns_ct[0]) < parseInt(cdate)) {
         dns_ct[0] = cdate;
@@ -716,7 +723,7 @@ app.patch('/manage-domain/update-record', async (req, res) => {
         data,
         record_id
     }
-    let sigveri = await confirmRegistrarSignature(req, date, authtokendata, timeauth, registrar_id);
+    let sigveri = await confirmRegistrarSignature(req, date, authtokendata);
     if (['NO_PUBLIC_KEY_LISTED', 'NO_KEY'].includes(sigveri)) {
         return res.status(500).json({
             'success': false,
