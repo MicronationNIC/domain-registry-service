@@ -532,7 +532,7 @@ app.post('/register-domain', async (req, res) => {
         });
     }
     // Check that domain name is not already registered
-    let qres0 = await client.query('SELECT domain_name FROM public.domains WHERE domain_name = $1', [domain_name_ascii]);
+    let qres0 = await client.query('SELECT expiration, renewal_time FROM public.domains WHERE domain_name = $1', [domain_name_ascii]);
     if (qres0.rowCount !== 0) {
         return res.status(409).json({
             'success': false,
@@ -554,8 +554,17 @@ app.post('/register-domain', async (req, res) => {
         }
     }
     
-    let expiration = (expiration_duration !== null && expiration_duration !== undefined && parseInt(expiration_duration) >= 0) ? new Date(new Date().getTime() + parseInt(expiration_duration)) : null;
-    let renewal_time_value = (renewal_time !== null && renewal_time !== undefined && parseInt(renewal_time) >= 0) ? new Date(new Date().getTime() + parseInt(renewal_time)) : null;
+    if (typeof renewal_time === 'string') renewal_time = parseInt(renewal_time);
+    if (typeof renewal_time !== 'number') renewal_time = null;
+    
+    let rt_positive = (renewal_time !== null && renewal_time >= 0);
+    if (renewal_time === null) renewal_time = 0;
+    
+    let old_expiration = qres0.rows[0]['expiration'] as Date | null;
+    let old_rtv = qres0.rows[0]['renewal_time']  as Date | null;
+    
+    let expiration = (rt_positive && old_expiration !== null) ? new Date(old_expiration.getTime() + renewal_time) : null;
+    let renewal_time_value = (rt_positive && old_rtv !== null) ? new Date(old_rtv.getTime() + renewal_time) : null;
     
     critical_processes_running += 1;
     // Add domain name to the database
