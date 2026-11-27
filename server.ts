@@ -289,8 +289,8 @@ function updateDomainFile(domain_name: string, json: {
         if (record === undefined) continue;
         if (!['A', 'AAAA', 'TXT'].includes(record['type'])) continue;
         if (record['name'] !== '@') record['name'] = validateDomain(record['name']);
-        text += '\n' + record['name'] + ' ';
-        if (record['ttl'] !== undefined) text += record['ttl'] + ' ';
+        text += '\n' + record['name'];
+        if (record['ttl'] !== undefined) text +=  ' ' + record['ttl'];
         text += ' IN ' + record['type'] + ' ';
         switch (record['type']) {
             case 'A':
