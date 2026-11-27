@@ -8,6 +8,7 @@ import { Client } from 'pg';
 import { domainToASCII } from 'node:url';
 import * as dnszone from '@nictool/dns-zone';
 import path from 'node:path';
+import cron from 'node-cron';
 const maindir = process.env.MAINDIR || '/etc/registryservice';
 const port = process.env.PORT || 443;
 const timegrace = process.env.TIMEGRACE === undefined ? 5000 : parseInt(process.env.TIMEGRACE); // In milliseconds
@@ -380,6 +381,23 @@ const client = new Client({
     port: process.env.POSTGRES_PORT === undefined ? 5432 : parseInt(process.env.POSTGRES_PORT),
 });
 client.connect();
+cron.schedule('0 * * * *', async () => {
+    try {
+        let res = await client.query('SELECT domain_name FROM domains WHERE expiration <= CURRENT_TIMESTAMP');
+        for (let row of res.rows) {
+            let domain_name = row['domain_name'];
+            let zones_conf_contents_split = fs.readFileSync(dns_cfg['zones-conf']).toString().split('\n\n');
+            let zones_conf_contents_split_new = [];
+            for (let item of zones_conf_contents_split) {
+                if (item.includes(domain_name)) continue;
+                zones_conf_contents_split_new.push(item);
+            }
+            updateFileAtomic(dns_cfg['zones-conf'], zones_conf_contents_split_new.join('\n\n'));
+            await client.query('DELETE FROM domains WHERE domain_name = $1', [domain_name]);
+            fs.rmSync(dns_cfg['zones-dir'] + '/db.' + domain_name);
+        }
+    } catch (err) {}
+});
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -525,34 +543,39 @@ app.post('/register-domain', async (req, res) => {
         });
     }
     
+    let expiration_duration = null;
+    let renewal_time = null;
+    
+    for (let authority of registrar_cfgs[registrar_id]['tld-authority']) {
+        if (authority['tld'] === tld) {
+            if ('domains-expire-after' in authority) expiration_duration = authority['domains-expire-after'];
+            if ('domain-name-renewal' in authority) renewal_time = authority['domain-name-renewal'];
+            break;
+        }
+    }
+    
+    let expiration = (expiration_duration !== null && expiration_duration !== undefined && parseInt(expiration_duration) >= 0) ? new Date(new Date().getTime() + parseInt(expiration_duration)) : null;
+    let renewal_time_value = (renewal_time !== null && renewal_time !== undefined && parseInt(renewal_time) >= 0) ? new Date(new Date().getTime() + parseInt(renewal_time)) : null;
+    
     critical_processes_running += 1;
     // Add domain name to the database
     let qres1 = await client.query(
-        'INSERT INTO public.domains(domain_name, domain_name_original, tld, registrar_id) VALUES($1, $2, $3, $4)',
+        'INSERT INTO public.domains(domain_name, domain_name_original, tld, registrar_id, expiration, renewal_time) VALUES($1, $2, $3, $4, $5, $6)',
         [
             domain_name_ascii,
             domain_name,
             tld,
-            registrar_id
+            registrar_id,
+            expiration,
+            renewal_time_value
         ]
     );
     
     // Assume CoreDNS for now
-    let dns_ct = fs.readFileSync(maindir + '/dns/dns_ct').toString().split(' '); // date, then daily count
-    
-    let cdate = `${setNumStrLen(date.getUTCFullYear(),4)}${setNumStrLen(date.getUTCMonth()+1)}${setNumStrLen(date.getUTCDate())}`;
-    
-    if (parseInt(dns_ct[0]) < parseInt(cdate)) {
-        dns_ct[0] = cdate;
-        dns_ct[1] = '0';
-    }
-    
-    dns_ct[1] = (parseInt(dns_ct[1]) + 1).toString();
-    
     fs.writeFileSync(dns_cfg['zones-dir'] + '/db.' + domain_name_ascii,
         `$ORIGIN ${domain_name_ascii}.\n$TTL 3600\n\n` + 
         `@ IN SOA ns1.${domain_name_ascii}. hostmaster.${domain_name_ascii}. ( ; SEPARATE HERE\n` +
-        `\t${dns_ct[0] + dns_ct[1]} ; SEPARATE HERE\n\t3600\n\t600\n\t1209600\n\t300\n)\n ; SEPARATE HERE\n`
+        `\t${getNewZoneSerial()} ; SEPARATE HERE\n\t3600\n\t600\n\t1209600\n\t300\n)\n ; SEPARATE HERE\n`
     );
     
     if (process.env.COREDNS_USER === undefined || process.env.COREDNS_GROUP === undefined) {
@@ -574,8 +597,6 @@ app.post('/register-domain', async (req, res) => {
     );
     fs.chmodSync(dns_cfg['zones-dir'] + '/db.' + domain_name_ascii, 0o640);
     
-    fs.writeFileSync(maindir + '/dns/dns_ct', dns_ct[0] + ' ' + dns_ct[1]);
-    
     const originalStat = fs.statSync(dns_cfg['zones-dir']);
     let conf_new_entry = `file ${dns_cfg['zones-dir']}/db.${domain_name_ascii} ${domain_name_ascii} {\n    reload 30s\n    fallthrough\n}`;
     fs.writeFileSync(dns_cfg['zones-conf'] + '.tmp', fs.readFileSync(dns_cfg['zones-conf']).toString() + '\n\n' + conf_new_entry);
@@ -590,7 +611,9 @@ app.post('/register-domain', async (req, res) => {
         'status_text': 'DOMAIN_SUCCESSFULLY_REGISTERED',
         'status_code': 201,
         'try_again': false,
-        'domain_name': domain_name
+        'domain_name': domain_name,
+        'expires_at': expiration,
+        'renew_at': renewal_time_value
     });
     
     if (critical_processes_running > 0) critical_processes_running -= 1;
@@ -935,9 +958,115 @@ app.delete('/manage-domain/delete-record', async (req, res) => {
     });
 });
 
+app.get('/manage-domain/renew/:domain_name', async (req, res) => {
+    let date = new Date();
+    let registrar_id = req.query.registrar_id as string;
+    let ignore_null_expiration = req.query.ignore_null_expiration;
+    let domain_name = validateDomain(req.params.domain_name);
+    let authheadertxt = req.header('Authorization');
+    if (authheadertxt === undefined) {
+        return res.status(401).json({
+            'success': false,
+            'status_text': 'MISSING_AUTHORIZATION_HEADER', // supposed to be Authorization because of the header name
+            'status_code': 401
+        });
+    }
+    let authheader = JSON.parse(authheadertxt);
+    let timeauth = authheader['timeauth'];
+    if (timeauth === undefined || typeof timeauth !== 'number') {
+        return res.status(422).json({
+            'success': false,
+            'status_text': 'INVALID_TIMEAUTH',
+            'status_code': 422
+        });
+    }
+    let authtokendata = {
+        timeauth,
+        registrar_id,
+        'intent': 'renew-domain',
+        domain_name,
+        'ignore_null_expiration': ignore_null_expiration === 'true'
+    };
+    let sigveri = await confirmRegistrarSignature(req, date, authtokendata);
+    if (['NO_PUBLIC_KEY_LISTED', 'NO_KEY'].includes(sigveri)) {
+        return res.status(500).json({
+            'success': false,
+            'status_text': 'SERVER_DOES_NOT_HAVE_REGISTRAR_KEY',
+            'status_code': 500
+        });
+    }
+    if (sigveri !== 'OK') {
+        return res.status(401).json({
+            'success': false,
+            'status_text': 'INVALID_REGISTRAR_CREDENTIALS',
+            'status_code': 401
+        });
+    }
+    
+    let qres0 = await client.query(
+        'SELECT expiration, renewal_time, tld WHERE domain_name = $1 AND registrar_id = $2',
+        [domain_name, registrar_id]
+    );
+    
+    if (qres0.rowCount === 0) {
+        return res.status(404).json({
+            'success': false,
+            'status_text': 'NO_DOMAIN_FOUND_UNDER_REGISTRAR',
+            'status_code': 404
+        });
+    }
+    
+    if (qres0.rows[0]['expiration'] === null && ignore_null_expiration !== 'true') {
+        return res.status(428).json({
+            'success': false,
+            'status_text': 'EXPIRATION_IS_NULL',
+            'status_code': 428
+        });
+    }
+    
+    if (qres0.rows[0]['renewal_time'] !== null && new Date(qres0.rows[0]['renewal_time']).getTime() > date.getTime()) {
+        return res.status(409).json({
+            'success': false,
+            'status_text': 'RENEWAL_TOO_EARLY',
+            'status_code': 409
+        });
+    }
+    
+    let expiration_duration = null;
+    let renewal_time = null;
+    
+    for (let authority of registrar_cfgs[registrar_id]['tld-authority']) {
+        if (authority['tld'] === qres0.rows[0]['tld']) {
+            if ('domains-expire-after' in authority) expiration_duration = authority['domains-expire-after'];
+            if ('domain-name-renewal' in authority) renewal_time = authority['domain-name-renewal'];
+            break;
+        }
+    }
+    
+    let new_expiration_time = (expiration_duration !== null && expiration_duration !== undefined && parseInt(expiration_duration) >= 0) ? new Date(new Date().getTime() + parseInt(expiration_duration)) : null;
+    let new_renewal_time = (renewal_time !== null && renewal_time !== undefined && parseInt(renewal_time) >= 0) ? new Date(new Date().getTime() + parseInt(renewal_time)) : null;
+    
+    let qres1 = await client.query(
+        'UPDATE domains SET expiration = $1, renewal_time = $2 WHERE domain_name = $3',
+        [new_expiration_time, new_renewal_time, domain_name]
+    );
+    
+    res.status(200).json({
+        'success': true,
+        'status_text': 'DOMAIN_RENEWED',
+        'status_code': 200,
+        'new_expiration_time': new_expiration_time === null ? null : new_expiration_time?.getTime(),
+        'new_renewal_time': new_renewal_time === null ? null : new_renewal_time?.getTime()
+    });
+});
+
 app.get('/source-code', (req, res) => {
     if (process.env.SOURCE_CODE) return res.redirect(process.env.SOURCE_CODE);
     return res.status(404).send('Error 404: Not Found');
+});
+
+app.get('/tos', (req, res) => {
+    return res.sendFile(maindir + '/tos.md');
 });
 
 https.createServer(options, app).listen(port, () => {

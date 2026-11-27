@@ -7,6 +7,7 @@ CREATE TABLE public.domains
 	time_registered TIMESTAMPTZ DEFAULT NOW(),
 	last_updated TIMESTAMPTZ DEFAULT NOW(),
 	expiration TIMESTAMPTZ,
-	registrar_id TEXT NOT NULL
+	registrar_id TEXT NOT NULL,
+    renewal_time TIMESTAMPTZ
 );
 ```
